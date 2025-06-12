@@ -74,93 +74,107 @@ export async function GET(request: NextRequest) {
       }
     }
     
-    // If no classes found in subjects collection, fall back to user data
-    if (assignedClasses.length === 0) {
-      assignedClasses = userData.assignedClasses || [];
-    }
-    
-    console.log("Teacher subjects from collection:", teacherSubjects);
-    console.log("Assigned classes from collection:", assignedClasses);
-    
-    // Fetch students
-    const studentsRef = collection(db, "users");
-    let studentsQuery;
-    
-    // If a specific subject is requested, filter by that subject
-    if (subject && subject !== "all") {
-      console.log("Filtering students by subject:", subject);
-      
-      // First, find the class IDs for this subject
-      const subjectClassesQuery = query(
-        subjectsRef, 
-        where("teacherId", "==", teacherId),
-        where("subjectName", "==", subject)
-      );
-      
-      const subjectClassesSnapshot = await getDocs(subjectClassesQuery);
-      const subjectClassIds = subjectClassesSnapshot.docs.map(doc => doc.data().classId).filter(Boolean);
-      
-      console.log("Classes for this subject:", subjectClassIds);
-      
-      if (subjectClassIds.length > 0) {
-        // Query students by class IDs
-        studentsQuery = query(
-          studentsRef,
-          where("role", "==", "student"),
-          where("grade", "in", subjectClassIds)
-        );
-      } else {
-        // Fallback to enrolled subjects if no classes found
-        studentsQuery = query(
-          studentsRef,
-          where("role", "==", "student"),
-          where("enrolledSubjects", "array-contains", subject)
-        );
-      }
-    } else {
-      // Otherwise filter by assigned classes
-      if (assignedClasses.length > 0) {
-        console.log("Filtering students by classes:", assignedClasses);
-        studentsQuery = query(
-          studentsRef,
-          where("role", "==", "student"),
-          where("grade", "in", assignedClasses)
-        );
-      } else {
-        // If no classes, get all students
-        console.log("No assigned classes, fetching all students");
-        studentsQuery = query(
-          studentsRef,
-          where("role", "==", "student")
-        );
-      }
-    }
-    
-    const studentsSnapshot = await getDocs(studentsQuery);
-    
-    if (studentsSnapshot.empty) {
-      console.log("No students found after filtering");
-      return NextResponse.json({ 
-        students: [],
-        subjects: teacherSubjects
-      });
-    }
-    
-    console.log(`Found ${studentsSnapshot.size} students after filtering`);
-    const students = studentsSnapshot.docs.map(doc => ({
-      id: doc.id,
-      name: doc.data().name,
-      class: doc.data().grade || "Unknown Class",
-      rollNumber: doc.data().rollNumber || "N/A",
-      avatar: doc.data().profilePicture || null,
-      subjects: doc.data().enrolledSubjects || []
-    }));
+    // Step 1 (Preserved): teacherSubjects is populated for the UI dropdown.
+    // Renaming teacherSubjects to teacherSubjectNames for clarity as it holds names.
+    const teacherSubjectNames = teacherSubjects;
+    console.log("Teacher's subject names for UI filter dropdown:", teacherSubjectNames);
 
-    console.log("Returning response with subjects:", teacherSubjects);
+    let subjectIdsToQueryEnrollments: string[] = [];
+
+    // Step 2 & 3: Determine relevant subject IDs (doc IDs from 'subjects' collection)
+    if (subject && subject !== "all") {
+      console.log(`Specific subject filter selected: teacherId=${teacherId}, subjectName=${subject}`);
+      // Query 'subjects' collection for specific subjectName taught by this teacher
+      // subjectsRef and subjectsSnapshot are already available from Step 1 logic
+      const specificSubjectDocs = subjectsSnapshot.docs.filter(
+        doc => doc.data().subjectName === subject && doc.data().teacherId === teacherId
+      );
+      subjectIdsToQueryEnrollments = specificSubjectDocs.map(doc => doc.id);
+      console.log(`Found ${subjectIdsToQueryEnrollments.length} subject document(s) for subjectName '${subject}' taught by teacher ${teacherId}: IDs=[${subjectIdsToQueryEnrollments.join(", ")}]`);
+    } else {
+      console.log(`"All subjects" filter selected for teacherId=${teacherId}`);
+      // Use all subject documents already fetched for this teacher (subjectsSnapshot)
+      subjectIdsToQueryEnrollments = subjectsSnapshot.docs.map(doc => doc.id);
+      console.log(`Found ${subjectIdsToQueryEnrollments.length} total subject document(s) for teacher ${teacherId}: IDs=[${subjectIdsToQueryEnrollments.join(", ")}]`);
+    }
+
+    if (subjectIdsToQueryEnrollments.length === 0) {
+      console.log("No subject documents found for the teacher based on the filter. Returning empty student list.");
+      return NextResponse.json({ students: [], subjects: teacherSubjectNames });
+    }
+
+    // Step 2e, 2f, 3e: Query 'enrollments' collection
+    const uniqueStudentIds = new Set<string>();
+    const enrollmentsRef = collection(db, "enrollments");
+
+    // Using 'in' query for enrollments, chunking if necessary
+    const MAX_SUBJECT_IDS_PER_ENROLLMENT_QUERY = 30; // Firestore 'in' query limit
+    for (let i = 0; i < subjectIdsToQueryEnrollments.length; i += MAX_SUBJECT_IDS_PER_ENROLLMENT_QUERY) {
+        const subjectIdsChunk = subjectIdsToQueryEnrollments.slice(i, i + MAX_SUBJECT_IDS_PER_ENROLLMENT_QUERY);
+        if (subjectIdsChunk.length === 0) continue;
+
+        console.log(`Querying enrollments for subjectId(s) chunk: [${subjectIdsChunk.join(", ")}]`);
+        const enrollmentQuery = query(enrollmentsRef, where("subjectId", "in", subjectIdsChunk));
+        const enrollmentSnap = await getDocs(enrollmentQuery);
+        console.log(`  Found ${enrollmentSnap.size} enrollments for this chunk of subjectId(s).`);
+        enrollmentSnap.forEach(enrollDoc => {
+            const studentId = enrollDoc.data().studentId;
+            if (studentId) {
+                uniqueStudentIds.add(studentId);
+                console.log(`    Added studentId: ${studentId} from enrollment ${enrollDoc.id} (subjectId: ${enrollDoc.data().subjectId})`);
+            } else {
+                console.warn(`    Enrollment document ${enrollDoc.id} is missing studentId.`);
+            }
+        });
+    }
+
+    // Step 2g, 2h: Check if any students found
+    if (uniqueStudentIds.size === 0) {
+      console.log("No students found enrolled (via enrollments collection) in the specified subject(s) for this teacher.");
+      return NextResponse.json({ students: [], subjects: teacherSubjectNames });
+    }
+
+    const studentIdsArray = Array.from(uniqueStudentIds);
+    console.log(`Total unique student IDs found from enrollments: ${studentIdsArray.length}, IDs=[${studentIdsArray.join(", ")}]`);
+
+    // Step 2i: Fetch full user details for each studentId
+    const studentProfiles: any[] = [];
+    const usersRef = collection(db, "users");
+    const MAX_STUDENT_IDS_PER_USER_QUERY = 30; // Firestore 'in' query limit
+
+    for (let i = 0; i < studentIdsArray.length; i += MAX_STUDENT_IDS_PER_USER_QUERY) {
+        const studentIdsChunk = studentIdsArray.slice(i, i + MAX_STUDENT_IDS_PER_USER_QUERY);
+        if (studentIdsChunk.length === 0) continue;
+
+        console.log(`Fetching user details for student ID chunk: [${studentIdsChunk.join(", ")}]`);
+        const usersQuery = query(
+            usersRef,
+            where("__name__", "in", studentIdsChunk),
+            where("role", "==", "student") // Ensure they are students
+        );
+        const usersSnapshot = await getDocs(usersQuery);
+        console.log(`  Fetched ${usersSnapshot.size} student profiles for this chunk.`);
+        usersSnapshot.forEach(userDoc => {
+            const studentData = userDoc.data();
+            studentProfiles.push({
+                id: userDoc.id,
+                name: studentData.name,
+                class: studentData.grade || "Unknown Class", // Assuming 'grade' is class display info
+                rollNumber: studentData.rollNumber || "N/A",
+                avatar: studentData.profilePicture || null,
+                // subjects: studentData.enrolledSubjects || [] // This might be subject names or IDs, ensure consistency if used
+            });
+        });
+    }
+    console.log(`Successfully fetched ${studentProfiles.length} student profiles.`);
+
+    // Step 2j: Return students and teacher's subject names
+    console.log("Returning response with students and teacher's subject names.");
     return NextResponse.json({ 
-      students,
-      subjects: teacherSubjects
+      students: studentProfiles,
+      subjects: teacherSubjectNames // Preserved from Step 1
     });
+
   } catch (error) {
     console.error("Error fetching students:", error);
     return NextResponse.json(
@@ -168,4 +182,15 @@ export async function GET(request: NextRequest) {
       { status: 500 }
     );
   }
-} 
+}
+//This section is removed as it is replaced by the new logic above.
+    if (studentList.length === 0) {
+      console.log("No students found matching criteria.");
+      return NextResponse.json({
+        students: [],
+        subjects: teacherSubjects
+      });
+    }
+
+// The catch block and outer structure are maintained.
+// The map function for 'students' is now integrated into the studentProfiles fetching loop.
