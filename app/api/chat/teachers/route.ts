@@ -39,59 +39,111 @@ export async function GET(request: NextRequest) {
       );
     }
     
-    const studentClass = userData.grade || userData.class;
-    
-    if (!studentClass) {
-      console.log(`Student ${userData.name} does not have class information`);
-      return NextResponse.json(
-        { error: "Student class information not found" },
-        { status: 404 }
-      );
-    }
+    // Step 1: Fetch Student Data & Validate
+    // Step 2: Get enrolledSubjects (array of subject document IDs)
+    const enrolledSubjectIds = userData.enrolledSubjects; // This is now an array of subject document IDs
+    console.log(`Student ${studentId} enrolled subject document IDs: ${JSON.stringify(enrolledSubjectIds)}`);
 
-    // Fetch teachers from users collection who have teacher role and teach this class
-    const teachersRef = collection(db, "users");
-    console.log(`Searching for teachers assigned to class: ${studentClass}`);
-    const teachersQuery = query(
-      teachersRef,
-      where("role", "==", "teacher"),
-      where("assignedClasses", "array-contains", studentClass)
-    );
-    
-    let teachersSnapshot = await getDocs(teachersQuery);
-    console.log(`Found ${teachersSnapshot.size} teachers assigned to class ${studentClass}`);
-    
-    // If no teachers found with the above query, try a simpler query for all teachers
-    if (teachersSnapshot.empty) {
-      console.log("No teachers found for the specific class, fetching all teachers...");
-      const allTeachersQuery = query(
-        teachersRef,
-        where("role", "==", "teacher")
-      );
-      teachersSnapshot = await getDocs(allTeachersQuery);
-      console.log(`Found ${teachersSnapshot.size} teachers in total`);
-    }
-    
-    if (teachersSnapshot.empty) {
-      console.log("No teachers found at all");
+    // Step 3: Validate enrolledSubjects
+    if (!Array.isArray(enrolledSubjectIds) || enrolledSubjectIds.length === 0) {
+      console.log(`Student ${studentId} has no enrolled subject IDs or 'enrolledSubjects' is not an array.`);
       return NextResponse.json({ teachers: [] });
     }
     
-    const teachers = teachersSnapshot.docs.map(doc => {
-      const data = doc.data();
-      console.log(`Teacher: ${data.name}, Subjects:`, data.subjects);
-      
-      return {
-        id: doc.id,
-        name: data.name,
-        subject: data.subjects && data.subjects.length > 0 ? data.subjects[0] : "Teacher",
-        email: data.email || "",
-        avatar: data.profilePicture || null,
-      };
+    // Step 4: Fetch subject documents and prepare teacherId-to-subjectName mapping
+    const teacherIdToSubjectNamesMap = new Map<string, Set<string>>();
+    
+    // Create a list of promises to fetch subject documents
+    const subjectDocsPromises = enrolledSubjectIds.map(subjectId => {
+      if (typeof subjectId !== 'string' || subjectId.trim() === '') {
+        console.warn(`Invalid subjectId found: "${subjectId}" in student ${studentId}'s enrolled list. Skipping.`);
+        return Promise.resolve(null); // Return a resolved promise with null for invalid IDs
+      }
+      return getDoc(doc(db, "subjects", subjectId.trim()));
     });
 
-    console.log(`Returning ${teachers.length} teachers`);
-    return NextResponse.json({ teachers });
+    const subjectDocSnaps = await Promise.all(subjectDocsPromises);
+    console.log(`Attempted to fetch ${enrolledSubjectIds.length} subject documents. Received ${subjectDocSnaps.length} results (some might be null or not found).`);
+
+    let validSubjectDocsFound = 0;
+    for (const subjectDocSnap of subjectDocSnaps) {
+      if (subjectDocSnap && subjectDocSnap.exists()) {
+        validSubjectDocsFound++;
+        const subjectData = subjectDocSnap.data();
+        const fetchedSubjectId = subjectDocSnap.id;
+        // 4b. Extract teacherId and subjectName
+        const { teacherId, subjectName } = subjectData; // classId is available but not used for filtering teachers per new req.
+        console.log(`  Processing Subject Doc ID: ${fetchedSubjectId}, Data: teacherId=${teacherId}, subjectName=${subjectName}`);
+        if (teacherId && subjectName) {
+          if (!teacherIdToSubjectNamesMap.has(teacherId)) {
+            teacherIdToSubjectNamesMap.set(teacherId, new Set<string>());
+          }
+          teacherIdToSubjectNamesMap.get(teacherId)!.add(subjectName);
+        } else {
+          console.warn(`  Subject Doc ID: ${fetchedSubjectId} is missing 'teacherId' or 'subjectName'.`);
+        }
+      } else {
+        // Logging for subject IDs that didn't yield a document
+        // This is harder to pinpoint which ID failed without mapping back, but Promise.all maintains order
+        // For now, a general warning is issued if counts don't match.
+      }
+    }
+    console.log(`Successfully fetched and processed ${validSubjectDocsFound} valid subject documents.`);
+
+    // Step 5: Collect unique teacherIds
+    const uniqueTeacherIds = Array.from(teacherIdToSubjectNamesMap.keys());
+    console.log(`Unique teacher IDs collected: ${JSON.stringify(uniqueTeacherIds)}`);
+    if (uniqueTeacherIds.length > 0) {
+        console.log("Teacher ID to their relevant student subjects map:",
+            Object.fromEntries(Array.from(teacherIdToSubjectNamesMap.entries()).map(([k, v]) => [k, Array.from(v)]))
+        );
+    }
+
+    // Step 6: If no unique teacherIds, return empty list
+    if (uniqueTeacherIds.length === 0) {
+      console.log("No unique teacher IDs found after processing student's enrolled subject documents.");
+      return NextResponse.json({ teachers: [] });
+    }
+
+    // Step 7: Fetch teacher user documents
+    const teachersList: any[] = [];
+    const MAX_IN_QUERY_ITEMS = 30;
+
+    for (let i = 0; i < uniqueTeacherIds.length; i += MAX_IN_QUERY_ITEMS) {
+        const teacherIdsChunk = uniqueTeacherIds.slice(i, i + MAX_IN_QUERY_ITEMS);
+        if (teacherIdsChunk.length === 0) continue;
+
+        console.log(`Fetching user details for teacher ID chunk: ${teacherIdsChunk.join(", ")}`);
+        const usersQuery = query(
+            collection(db, "users"),
+            where("__name__", "in", teacherIdsChunk),
+            where("role", "==", "teacher")
+        );
+        const teachersSnapshot = await getDocs(usersQuery);
+
+        teachersSnapshot.forEach(teacherUserDoc => {
+            const teacherUserData = teacherUserDoc.data();
+            const teacherId = teacherUserDoc.id;
+            console.log(`  Fetched teacher user: ID=${teacherId}, Name=${teacherUserData.name}`);
+
+            // Step 8: Construct final list of teacher objects
+            const relevantSubjectNamesSet = teacherIdToSubjectNamesMap.get(teacherId);
+            const subjectNamesString = relevantSubjectNamesSet
+                ? Array.from(relevantSubjectNamesSet).join(", ")
+                : "N/A";
+
+            teachersList.push({
+                id: teacherId,
+                name: teacherUserData.name,
+                subject: subjectNamesString,
+                avatar: teacherUserData.profilePicture || null,
+                // email: teacherUserData.email || "" // Email can be added if needed by frontend
+            });
+        });
+    }
+
+    console.log(`Returning ${teachersList.length} formatted teacher object(s) for student ${studentId}.`);
+    return NextResponse.json({ teachers: teachersList });
   } catch (error) {
     console.error("Error fetching teachers:", error);
     return NextResponse.json(
