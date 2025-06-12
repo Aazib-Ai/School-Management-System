@@ -99,39 +99,45 @@ export default function TeacherChatPage() {
     getTeacherInfo()
   }, [toast])
 
-  // Fetch teacher's subjects
+  // Fetch teacher's subjects - This might be redundant if /api/chat/students also returns subjects
+  // For now, keeping it as per existing structure, but noting redundancy if data.subjects from fetchStudents is used.
   useEffect(() => {
-    const fetchSubjects = async () => {
+    const fetchTeacherSubjects = async () => {
       if (!teacherInfo?.id) return;
       
-      try {
-        const response = await fetch(`/api/chat/teachers/subjects?teacherId=${teacherInfo.id}`);
-        if (!response.ok) {
-          throw new Error('Failed to fetch subjects');
-        }
-        const data = await response.json();
-        
-        console.log("Fetched subjects:", data);
-        
-        if (Array.isArray(data) && data.length > 0) {
-          setSubjects(data);
-        } else {
-          console.warn("No subjects returned from API");
-          setSubjects(["Mathematics", "Science", "English", "History"]);
-        }
-      } catch (error) {
-        console.error('Error fetching subjects:', error);
-        toast({
-          title: "Error",
-          description: "Failed to fetch subjects",
-        });
-        // Fallback subjects if fetch fails
-        setSubjects(["Mathematics", "Science", "English", "History"]);
+      // This check is to see if fetchStudents will provide the subjects.
+      // If fetchStudents is the primary source, this effect might only run if data.subjects wasn't available.
+      // However, the new requirement is that fetchStudents *will* provide it.
+      // So, this useEffect might be removable if setSubjects in fetchStudents is reliable.
+      // For now, let it run if `subjects` state is empty.
+      if (subjects.length > 0 && selectedSubject !== 'all') { // Avoid re-fetching if subjects are already there, unless filter is 'all'
+         // If filter is 'all', we might want to ensure we have the *complete* list of subjects from the teacher.
+         // But /api/chat/students should give the full list if selectedSubject is 'all'.
+         // This logic is a bit convoluted due to potentially two sources of subjects.
+         // Prioritizing subjects from /api/chat/students as per new instructions.
       }
+
+      // If subjects are not populated by fetchStudents, this can be a fallback or primary source.
+      // Given the subtask, fetchStudents will now call setSubjects.
+      // This useEffect is now more of a backup or initial fetch if teacherInfo arrives before selectedSubject triggers fetchStudents.
+      // To simplify, this useEffect will be commented out or removed if fetchStudents reliably provides subjects.
+      // For this subtask, we assume fetchStudents is the primary source for subjects.
+      // console.log("Running legacy fetchTeacherSubjects. Current subjects state:", subjects);
+      // This effect will be reviewed later for redundancy. For now, let it exist but be mindful.
+      // No API call here for now, as fetchStudents is expected to handle it.
     };
 
-    fetchSubjects();
-  }, [teacherInfo, toast])
+    // fetchTeacherSubjects(); // Temporarily disable direct call if fetchStudents handles it
+  }, [teacherInfo, toast, subjects.length, selectedSubject])
+
+
+  // New useEffect to reset active student and messages when selectedSubject changes
+  useEffect(() => {
+    console.log(`Selected subject changed to: ${selectedSubject}. Resetting active student and messages.`);
+    setActiveStudent(null);
+    setMessages([]);
+  }, [selectedSubject]);
+
 
   // Fetch students for this teacher
   useEffect(() => {
@@ -141,34 +147,37 @@ export default function TeacherChatPage() {
       setLoadingStudents(true)
       try {
         // Fetch students for this teacher based on selected subject
-        const queryParam = selectedSubject !== 'all' ? `&subject=${selectedSubject}` : '';
+        const queryParam = selectedSubject !== 'all' ? `&subject=${encodeURIComponent(selectedSubject)}` : '';
         const response = await fetch(`/api/chat/students?teacherId=${teacherInfo.id}${queryParam}`)
         const data = await response.json()
         
-        console.log("API response:", data);
+        console.log("API response from /api/chat/students:", data);
         
         if (data.error) {
           throw new Error(data.error)
         }
-        
-        if (!data.students || data.students.length === 0) {
-          console.log("No students found, trying to fetch all students");
-          // If no students found with the selected subject, fetch all students
-          const allResponse = await fetch(`/api/chat/students?teacherId=${teacherInfo.id}`);
-          const allData = await allResponse.json();
-          
-          if (allData.error) {
-            throw new Error(allData.error);
+
+        // Set subjects for the dropdown from this API response (1b)
+        if (data.subjects && Array.isArray(data.subjects)) {
+          if (data.subjects.length > 0) {
+            setSubjects(data.subjects);
+            console.log("Updated subjects dropdown from /api/chat/students:", data.subjects);
+          } else {
+            console.warn("No subjects list returned from /api/chat/students, using fallback.");
+            setSubjects(["Mathematics", "Science", "English", "History"]); // Fallback
           }
-          
-          if (allData.students && allData.students.length > 0) {
-            data.students = allData.students;
-          }
+        } else {
+          console.warn("/api/chat/students did not return a 'subjects' array. Using fallback for dropdown.");
+          setSubjects(["Mathematics", "Science", "English", "History"]); // Fallback
         }
         
+        // No client-side fallback to fetch all students if data.students is empty (1a)
+        const currentStudentListData = data.students || [];
+        console.log("Students from API (no fallback):", currentStudentListData);
+
         // Get unread message counts for each student
         const studentsWithUnread = await Promise.all(
-          data.students.map(async (student: Student) => {
+          currentStudentListData.map(async (student: Student) => {
             const unreadResponse = await fetch(`/api/chat/messages?studentId=${student.id}&teacherId=${teacherInfo.id}`)
             const unreadData = await unreadResponse.json()
             
@@ -185,9 +194,21 @@ export default function TeacherChatPage() {
         )
         
         console.log("Students with unread:", studentsWithUnread);
-        setStudents(studentsWithUnread)
+        setStudents(studentsWithUnread);
+
+        // Consistency check for activeStudent (1c)
+        if (activeStudent && !studentsWithUnread.find(s => s.id === activeStudent.id)) {
+            console.log("Active student no longer in the new student list. Resetting active student and messages.");
+            setActiveStudent(null);
+            setMessages([]);
+        } else if (studentsWithUnread.length === 0 && activeStudent) {
+            console.log("New student list is empty. Resetting active student and messages.");
+            setActiveStudent(null);
+            setMessages([]);
+        }
+
       } catch (error) {
-        console.error("Error fetching students:", error)
+        console.error("Error fetching students:", error);
         toast({
           title: "Error",
           description: "Failed to fetch students. Please try again later.",
