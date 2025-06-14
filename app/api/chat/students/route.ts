@@ -183,4 +183,4 @@ export async function GET(request: NextRequest) {
     );
   }
 }
-// Remnants of old logic removed. File ends after the GET function's closing brace.
+

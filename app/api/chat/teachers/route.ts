@@ -1,8 +1,3 @@
-import { NextRequest, NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { db } from "@/lib/firebase";
-import { collection, getDocs, query, where, doc, getDoc } from "firebase/firestore";
-
 // GET: Fetch teachers for a specific student based on enrollment
 export async function GET(request: NextRequest) {
   try {
@@ -151,4 +146,4 @@ export async function GET(request: NextRequest) {
       { status: 500 }
     );
   }
-} 
+}
